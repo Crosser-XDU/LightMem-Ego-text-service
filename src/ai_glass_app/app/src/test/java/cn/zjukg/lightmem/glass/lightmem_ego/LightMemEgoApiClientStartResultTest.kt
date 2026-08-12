@@ -1,0 +1,103 @@
+package cn.zjukg.lightmem.glass.lightmem_ego
+
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
+import org.junit.Test
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+
+class LightMemEgoApiClientStartResultTest {
+    private val dateLabelFormatter = DateTimeFormatter.ofPattern("yyyy.M.d")
+
+    @Test
+    fun parsesTopLevelDateLabelWhenDayContextIsMissing() {
+        val result = LightMemEgoApiClient().parseStartResult(
+            json = JSONObject()
+                .put("session_id", "parent__day3")
+                .put("date_label", "2026.7.11")
+                .put("day_index", 3)
+                .put("input_mode", "rokid_frame_audio"),
+            requestedParentSessionId = "",
+            inputMode = "rokid_frame_audio",
+            runId = "run-1",
+        )
+
+        assertEquals("2026.7.11", result.dayLabel)
+        assertEquals(3, result.dayIndex)
+    }
+
+    @Test
+    fun ignoresDayLabelFromChildSessionId() {
+        val result = LightMemEgoApiClient().parseStartResult(
+            json = JSONObject()
+                .put("session_id", "parent")
+                .put("child_session_id", "parent__day7")
+                .put("input_mode", "rokid_frame_audio"),
+            requestedParentSessionId = "",
+            inputMode = "rokid_frame_audio",
+            runId = "run-1",
+        )
+
+        assertEquals(dateLabelFormatter.format(LocalDate.now()), result.dayLabel)
+        assertNotEquals("DAY7", result.dayLabel)
+        assertEquals(0, result.dayIndex)
+    }
+
+    @Test
+    fun ignoresNumericDayLabel() {
+        val result = LightMemEgoApiClient().parseStartResult(
+            json = JSONObject()
+                .put("session_id", "parent")
+                .put("day", "4")
+                .put("input_mode", "rokid_frame_audio"),
+            requestedParentSessionId = "",
+            inputMode = "rokid_frame_audio",
+            runId = "run-1",
+        )
+
+        assertEquals(dateLabelFormatter.format(LocalDate.now()), result.dayLabel)
+        assertNotEquals("4", result.dayLabel)
+        assertEquals(0, result.dayIndex)
+    }
+
+    @Test
+    fun ignoresNullStringDateLabel() {
+        val result = LightMemEgoApiClient().parseStartResult(
+            json = JSONObject()
+                .put("session_id", "parent")
+                .put(
+                    "day_context",
+                    JSONObject()
+                        .put("date_label", "null")
+                        .put("dayLabel", "None"),
+                )
+                .put("date_label", "null")
+                .put("input_mode", "rokid_frame_audio"),
+            requestedParentSessionId = "",
+            inputMode = "rokid_frame_audio",
+            runId = "run-1",
+        )
+
+        assertEquals(dateLabelFormatter.format(LocalDate.now()), result.dayLabel)
+        assertNotEquals("null", result.dayLabel)
+    }
+
+    @Test
+    fun defaultsToRokidHttpUploadPaths() {
+        val result = LightMemEgoApiClient().parseStartResult(
+            json = JSONObject()
+                .put("session_id", "session-123")
+                .put("input_mode", "rokid_frame_audio"),
+            requestedParentSessionId = "",
+            inputMode = "rokid_frame_audio",
+            runId = "run-1",
+        )
+
+        assertEquals("rokid_frame_audio", result.inputMode)
+        assertEquals("/rokid/session-123/frame", result.frameUploadPath)
+        assertEquals("/rokid/session-123/audio_chunk", result.audioUploadPath)
+        assertEquals("/rokid/session-123/status", result.statusPath)
+        assertEquals("/rokid/session-123/audio_question", result.audioQuestionPath)
+    }
+}
