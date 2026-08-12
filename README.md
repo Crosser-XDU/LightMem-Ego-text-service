@@ -238,12 +238,90 @@ cd src/ai_glass_app
 
 ## Text-Only Benchmark API
 
-This repository also includes a benchmark-oriented **LightMem-Ego text-only ablation** in `src/backend/lightmem_text_memory_api_server.py`. It keeps the paper-level memory structure for text evidence while disabling the wearable multimodal inputs:
+This repository adds a benchmark-oriented **LightMem-Ego text-only method ablation** alongside the official wearable pipeline. It is not a plain vector-database wrapper: it preserves the `M_st` / `M_lt` hierarchy and reuses LightMem-Ego's routing, short-term retrieval, EM2Mem artifact layout, and evidence fusion, while replacing multimodal memory construction with a deterministic text adapter.
 
-- Text messages from `/add` become timestamped pseudo micro-events for short-term memory (`M_st`).
-- Long-term memory (`M_lt`) is built as EM2Mem-style 30s / 3min / 10min / 1h captions, episodic sidecars, and semantic facts.
-- Retrieval still runs the LightMem-Ego router, planner, short-term retriever, long-term text retrieval, and fusion path.
-- Current visual memory (`M_cur`), images, video, audio, ASR, VLM captioning, and visual evidence are disabled.
+### Upstream provenance
+
+The server source was originally copied from the [official LightMem-Ego repository](https://github.com/zjunlp/LightMem-Ego) without its upstream `.git` directory. Therefore, the exact historical fork commit cannot be recovered honestly. The implementation was rechecked against official `main` at [`b6aa0f7`](https://github.com/zjunlp/LightMem-Ego/tree/b6aa0f719d95acfc3d92ebe338bf31fcf97bfd10) on 2026-08-13; that commit is a comparison reference, **not** a claimed fork base. The description below is scoped to the text-only service and does not claim that every copied file is byte-for-byte identical to current upstream.
+
+### What was added
+
+| File | Change on top of LightMem-Ego |
+| :--- | :--- |
+| `src/backend/lightmem_text_memory_api_server.py` | New standalone `/add`, `/search`, and `/health` benchmark service plus the text-to-LightMem adapter. |
+| `src/backend/text_embedding_server.py` | New local OpenAI-compatible SentenceTransformers embedding endpoint. |
+| `src/backend/scripts/start_lightmem_text_memory_api.sh` / `stop_lightmem_text_memory_api.sh` | Start and stop the text memory service on port `8767`. |
+| `src/backend/scripts/start_text_embedding_server.sh` / `stop_text_embedding_server.sh` | Start and stop the embedding endpoint on port `8010`, using GPU 4 by default. |
+| `src/backend/scripts/smoke_lightmem_text_api.sh` | Minimal health, add, and search integration test. |
+| `src/backend/docs/lightmem_text_ablation.md` | Detailed API, memory construction, retrieval, deployment, and ablation notes. |
+
+The text service is a separate entrypoint. It does not require the glasses app, web capture, the official `api_server.py`, or the online media workers, and it does not replace those components.
+
+### Official pipeline versus this text ablation
+
+| Stage | Official multimodal LightMem-Ego | This repository's text-only implementation |
+| :--- | :--- | :--- |
+| Input | Glasses/browser frames and audio, followed by preprocessing, ASR, and VLM captioning. | `/add` accepts timestamped `user`, `assistant`, `system`, or `tool` text messages. |
+| Current memory (`M_cur`) | Maintains current visual context for questions about the live scene. | Disabled; all current-memory and image-evidence flags are forced off. |
+| Short-term construction (`M_st`) | Builds micro-events from stream boundaries, aligned transcripts, keyframes, actions, and visual changes. | Converts each message into one timestamped pseudo micro-event. The raw text becomes its transcript and `"{role}: {content}"` becomes its caption; keyframes and visual fields remain empty. |
+| Short-term storage/retrieval | Uses `MSTStore`, the LightMem micro-event schema, and `MSTRetriever`. | Reuses those same repository modules. Active and archive windows are enlarged so benchmark records are not evicted during a run. |
+| Long-term construction (`M_lt`) | Consolidates multimodal episodes into EM2Mem captions, episodic sidecars, semantic memory, and visual evidence. | Starts from text-only `M_st`; one message produces one base episode in the 30-second artifact format, then the existing EM2Mem writers build 30s / 3min / 10min / 1h captions and sidecars. Semantic facts/triplets use the deterministic `rule` backend; visual evidence is an empty list. |
+| Routing and planning | `MemoryRouter` and `RetrievalPlanner` select `M_cur`, `M_st`, `M_lt`, text, and visual evidence according to query and runtime state. | Reuses `MemoryRouter` and `RetrievalPlanner`, then constrains the plan to `retrieval_mode=text_only`, disables `M_cur`/images, and keeps available `M_st` and `M_lt` searchable. |
+| Long-term retrieval | Can use the full EM2Mem text/semantic/visual retrieval stack. | Adapter-specific text retrieval loads multiscale captions and semantic facts, prefilters them lexically, embeds the reduced candidate set, and ranks by dense, lexical, source-scale, graph, and recency signals. |
+| Fusion | `MemoryFusion` combines evidence selected from the memory hierarchy. | Reuses `MemoryFusion` to combine native `M_st` results with text-only `M_lt` results. |
+| Output | The full query pipeline may generate a final memory-grounded answer with multimodal evidence. | `/search` returns ranked evidence only as `id`, `content`, `score`, and `created_at`; the benchmark harness performs any downstream answering/scoring. |
+
+"Reuses" above means that the adapter imports and calls the pre-existing LightMem-Ego modules in this source tree rather than reimplementing their responsibilities. It does not mean every local module is identical to the latest official `main`.
+
+### Exact write path
+
+```text
+POST /add
+  -> validate request_id, user_id, session_id, role, timestamp, and content
+  -> keep content unchanged as raw_content
+  -> create stable memory metadata and an embedding input containing scope/role/time
+  -> persist the raw record and embedding in SQLite
+  -> during /search (default lazy build), or immediately when LIGHTMEM_TEXT_BUILD_ON_ADD=1:
+       message -> text M_st micro-event -> base episode/evidence document
+       -> EM2Mem 30s/3min/10min/1h captions
+       -> episodic sidecars + rule-based semantic facts
+```
+
+No LLM rewrites the incoming message. The adapter adds metadata only to `display_content` and `searchable_content`. A `request_id` should be globally unique within one deployment because it is used for idempotent upsert together with the message index.
+
+Memory artifacts are isolated by a stable hash of `user_id + session_id` when `/search` includes `session_id`. Omitting `session_id` intentionally selects all records under the user for backward compatibility. Artifact construction uses a full scope rebuild rather than the official streaming worker's incremental media pipeline; by default the build is triggered lazily so `/add` stays fast.
+
+### Exact search path
+
+```text
+POST /search
+  -> select records by user_id + optional session_id
+  -> ensure text-only M_st and M_lt artifacts exist
+  -> MemoryRouter
+  -> RetrievalPlanner, constrained to text_only with M_cur/images disabled
+  -> MSTRetriever over active + archived text micro-events
+  -> multiscale M_lt caption/semantic retrieval
+  -> MemoryFusion
+  -> deduplicated top_k benchmark evidence
+```
+
+For long-term candidates, the adapter first applies a bounded lexical/graph/source/recency prefilter and then scores the remaining texts as:
+
+```text
+0.46 * dense_embedding
++ 0.28 * lexical_overlap
++ 0.12 * source_scale_bonus
++ 0.08 * semantic_triplet_overlap
++ 0.06 * relative_recency
+```
+
+This long-term scorer is a text-only adaptation, not an unchanged call to the official multimodal retriever. The default embedding model is `all-MiniLM-L6-v2` served locally on GPU 4; this is also a deployment substitution, not the paper's visual embedding path. If method-level retrieval raises an exception or produces no evidence, the service falls back to raw SQLite text retrieval using dense and lexical similarity so the HTTP contract remains available. `/health` exposes the selected embedding backend and the latest method error.
+
+By default, multiple-choice `options` are appended to the retrieval query. Set `LIGHTMEM_TEXT_INCLUDE_OPTIONS_IN_QUERY=0` for query-only retrieval and report this setting in benchmark results.
+
+### Method fidelity boundary
+
+The retained methodological core is hierarchical `M_st + M_lt` memory, multiscale long-term artifacts, query-dependent routing/planning, separate short-/long-term retrieval, and evidence fusion. The deliberate ablation differences are direct text ingestion, no `M_cur`, no media/ASR/VLM/visual evidence, rule-based consolidation metadata, a local text embedding model, full-scope lazy rebuilds, and ranked-evidence output without final answer generation. Results from this service should therefore be reported as **LightMem-Ego text-only ablation**, not as the full multimodal LightMem-Ego system.
 
 Start the local text embedding service and API:
 
